@@ -517,14 +517,6 @@ providers/implementations/rands/test_rng.inc
 *.0
 
 # All kinds of libraries and executables
-*.a
-*.so
-*.so.*
-*.dylib
-*.dylib.*
-*.dll
-*.dll.*
-*.exe
 *.pyc
 *.exp
 *.lib
@@ -563,3 +555,18 @@ lcov.info
 run_tests
 depend
 
+/user/logs
+/user/_build
+
+# Force-include user/release/<platform>/<arch>/<version>/... even though an earlier upstream
+# pattern in this file (*.0, meant for OpenSSL's own certificate hash symlinks) also matches
+# our version-numbered directories (e.g. "4.2.0"). A matched directory is pruned outright, so
+# git won't even look inside it for exceptions unless every level down to it is re-included
+# explicitly (see `man gitignore`, "It is not possible to re-include a file if a parent
+# directory of that file is excluded") -- hence one negation per path segment below, not just
+# a single `!/user/release/**`.
+!/user/release/
+!/user/release/*/
+!/user/release/*/*/
+!/user/release/*/*/*/
+!/user/release/*/*/*/**

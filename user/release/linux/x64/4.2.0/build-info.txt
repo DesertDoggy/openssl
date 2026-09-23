@@ -1,0 +1,7 @@
+timestamp=20260923-094822
+platform=linux
+arch=x64
+version=4.2.0
+openssl_configure_target=linux-x86_64 
+git_commit=411499a19c
+log_file=/home/max/Documents/GitHub/romexplorer/submodules/openssl/user/logs/build-openssl-20260923-094822.log

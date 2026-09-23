@@ -1,0 +1,335 @@
+#!/bin/sh
+# Builds OpenSSL (libssl + libcrypto) as shared libraries, out-of-tree, for one of
+# mac/ios/android/linux/windows. This is what mariadb-connector-c's build script
+# (../../mariadb-connector-c/user/scripts/build_connector_c.sh) points its OPENSSL_ROOT_DIR
+# at, so neither connector-c nor the mariadb-server build ever depends on a system-installed
+# OpenSSL/GnuTLS -- same command, same result, on Linux, macOS and Windows.
+#
+# No source patch is needed: this uses OpenSSL's own perl Configure/make, fully out-of-tree
+# (nothing is written back into the submodule's own tree), same as every other build script
+# in this repo. Output lands under user/release/<platform>/<arch>/<version>/{shared,include}.
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+ROOT_DIR=$(CDPATH= cd -- "${SCRIPT_DIR}/../.." && pwd)
+USER_DIR="${ROOT_DIR}/user"
+RELEASE_DIR="${USER_DIR}/release"
+BUILD_ROOT="${USER_DIR}/_build"
+STAGE_ROOT="${BUILD_ROOT}/_stage"
+LOG_DIR="${USER_DIR}/logs"
+
+PLATFORM=""
+PLATFORM_SET=0
+CLEAN=1
+VERSION_OVERRIDE=""
+
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+LOG_FILE="${LOG_DIR}/build-openssl-${TIMESTAMP}.log"
+
+mkdir -p "${LOG_DIR}" "${RELEASE_DIR}" "${BUILD_ROOT}" "${STAGE_ROOT}"
+: > "${LOG_FILE}"
+
+log_line() {
+    level="$1"
+    shift
+    line="[${level}] $*"
+    printf '%s\n' "${line}"
+    printf '%s\n' "${line}" >> "${LOG_FILE}"
+}
+
+run_and_log() {
+    log_line INFO "RUN: $*"
+    tmp_log="${LOG_DIR}/.cmd-$$-$(date +%s).log"
+    rc=0
+    "$@" > "${tmp_log}" 2>&1 || rc=$?
+    cat "${tmp_log}" | tee -a "${LOG_FILE}"
+    rm -f "${tmp_log}"
+    [ "${rc}" -eq 0 ] && return 0
+    log_line ERROR "Command failed (exit=${rc}): $*"
+    return "${rc}"
+}
+
+run_and_log_in() {
+    # Same as run_and_log, but runs "$@" with cwd set to $1 first.
+    dir="$1"; shift
+    log_line INFO "RUN (in ${dir}): $*"
+    tmp_log="${LOG_DIR}/.cmd-$$-$(date +%s).log"
+    rc=0
+    ( cd "${dir}" && "$@" ) > "${tmp_log}" 2>&1 || rc=$?
+    cat "${tmp_log}" | tee -a "${LOG_FILE}"
+    rm -f "${tmp_log}"
+    [ "${rc}" -eq 0 ] && return 0
+    log_line ERROR "Command failed (exit=${rc}): $*"
+    return "${rc}"
+}
+
+usage() {
+    cat << 'EOF'
+Usage:
+  sh user/scripts/build_openssl.sh [options]
+
+Options:
+  --platform <mac|ios|android|linux|windows>
+  --clean | --no-clean
+  --version <value>
+  --help
+
+Environment variables:
+  IOS_CROSS_TOP / IOS_CROSS_SDK  Optional for iOS; auto-detected via `xcrun` when unset
+                                  (needs a macOS host with Xcode command line tools)
+  ANDROID_NDK_HOME                Required for --platform android
+  ANDROID_API                     Optional for Android (default: 24)
+  WINDOWS_CROSS_PREFIX             Optional mingw-w64 cross prefix (default:
+                                  x86_64-w64-mingw32-) used on a non-Windows host
+  LINUX_X64_CROSS_PREFIX          Optional cross-compiler prefix for a Linux x64 cross build
+  JOBS                            Optional build parallelism (default: host CPU count)
+
+Every target builds shared libssl/libcrypto, skips the test suite and docs (no-tests
+no-docs), and installs only libs+headers (`make install_sw`) -- no system OpenSSL install is
+ever touched or required.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --platform)
+            [ "$#" -ge 2 ] || { log_line ERROR "Missing value for --platform"; exit 2; }
+            PLATFORM="$2"; PLATFORM_SET=1; shift 2 ;;
+        --clean) CLEAN=1; shift ;;
+        --no-clean) CLEAN=0; shift ;;
+        --version)
+            [ "$#" -ge 2 ] || { log_line ERROR "Missing value for --version"; exit 2; }
+            VERSION_OVERRIDE="$2"; shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) log_line ERROR "Unknown argument: $1"; usage; exit 2 ;;
+    esac
+done
+
+if [ "${PLATFORM_SET}" -eq 1 ]; then
+    case "${PLATFORM}" in
+        mac|ios|android|linux|windows) ;;
+        *) log_line ERROR "Invalid --platform value: ${PLATFORM}"; exit 2 ;;
+    esac
+else
+    host_os=$(uname -s)
+    case "${host_os}" in
+        Darwin) PLATFORM="mac" ;;
+        Linux) PLATFORM="linux" ;;
+        MINGW*|MSYS*|CYGWIN*) PLATFORM="windows" ;;
+        *) log_line ERROR "Unsupported host OS: ${host_os}. Use --platform to select a target explicitly."; exit 2 ;;
+    esac
+    log_line INFO "Auto-detected host platform '${PLATFORM}' from '${host_os}'."
+fi
+
+if ! command -v perl >/dev/null 2>&1; then
+    log_line ERROR "perl was not found. OpenSSL's build (Configure) needs it. Install perl and retry."
+    exit 2
+fi
+if ! command -v make >/dev/null 2>&1; then
+    log_line ERROR "make was not found. Install make (or mingw32-make on Windows, on PATH as 'make') and retry."
+    exit 2
+fi
+
+if [ -n "${VERSION_OVERRIDE}" ]; then
+    VERSION="${VERSION_OVERRIDE}"
+    log_line INFO "Using version override: ${VERSION}"
+else
+    VERSION=$(
+        awk -F= '
+            /^MAJOR=/ { maj=$2 }
+            /^MINOR=/ { min=$2 }
+            /^PATCH=/ { pat=$2 }
+            END { if (maj != "" && min != "" && pat != "") print maj "." min "." pat }
+        ' "${ROOT_DIR}/VERSION.dat" 2>/dev/null
+    )
+    if [ -z "${VERSION}" ]; then
+        VERSION=$(git -C "${ROOT_DIR}" describe --tags --always 2>/dev/null || date +%Y%m%d)
+        log_line FALLBACK "Could not read VERSION.dat. Using ${VERSION}."
+    else
+        log_line INFO "Using repo version: ${VERSION}"
+    fi
+fi
+
+if [ "${CLEAN}" -eq 1 ]; then
+    log_line INFO "Cleaning build/stage roots"
+    rm -rf "${BUILD_ROOT}" "${STAGE_ROOT}"
+    mkdir -p "${BUILD_ROOT}" "${STAGE_ROOT}"
+fi
+
+JOBS_DEFAULT=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+JOBS=${JOBS:-${JOBS_DEFAULT}}
+
+collect_artifacts() {
+    stage_dir="$1"
+    platform_name="$2"
+    arch_name="$3"
+    config_line="$4"
+
+    out_base="${RELEASE_DIR}/${platform_name}/${arch_name}/${VERSION}"
+    out_shared="${out_base}/shared"
+    out_include="${out_base}/include"
+    mkdir -p "${out_shared}" "${out_include}"
+
+    for libdir in lib lib64; do
+        d="${stage_dir}/${libdir}"
+        [ -d "${d}" ] || continue
+        # -type f -o -type l (not just -f): libssl.so/libcrypto.so are symlinks to the
+        # versioned .so.N -- skipping symlinks here would leave CMake's find_package(OpenSSL)
+        # unable to find the unversioned name to link against. cp -P copies them as symlinks
+        # (both link and target land in the same output dir, so the relative link still resolves).
+        find "${d}" -maxdepth 1 \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' -o -name '*.dll' -o -name '*.dll.a' -o -name '*.lib' \) | while IFS= read -r f; do
+            cp -Pf "${f}" "${out_shared}/"
+        done
+    done
+    # MinGW/MSVC builds place the .dll itself next to the binaries, not in lib/.
+    find "${stage_dir}/bin" -maxdepth 1 -type f -name '*.dll' 2>/dev/null | while IFS= read -r f; do
+        cp -f "${f}" "${out_shared}/" 2>/dev/null || true
+    done
+
+    if [ -d "${stage_dir}/include" ]; then
+        cp -R "${stage_dir}/include/." "${out_include}/"
+    fi
+
+    {
+        echo "timestamp=${TIMESTAMP}"
+        echo "platform=${platform_name}"
+        echo "arch=${arch_name}"
+        echo "version=${VERSION}"
+        echo "openssl_configure_target=${config_line}"
+        echo "git_commit=$(git -C "${ROOT_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+        echo "log_file=${LOG_FILE}"
+    } > "${out_base}/build-info.txt"
+
+    log_line INFO "Artifacts saved to ${out_base}"
+}
+
+build_one() {
+    platform_name="$1"
+    arch_name="$2"
+    configure_target="$3"
+    extra_args="$4"
+
+    build_dir="${BUILD_ROOT}/${platform_name}/${arch_name}"
+    stage_dir="${STAGE_ROOT}/${platform_name}-${arch_name}"
+    rm -rf "${build_dir}" "${stage_dir}"
+    mkdir -p "${build_dir}" "${stage_dir}"
+
+    log_line INFO "Configuring ${platform_name}/${arch_name} (target: ${configure_target})"
+    # shellcheck disable=SC2086
+    if ! run_and_log_in "${build_dir}" perl "${ROOT_DIR}/Configure" ${configure_target} shared no-tests no-docs \
+            --prefix="${stage_dir}" --openssldir="${stage_dir}/ssl" ${extra_args}; then
+        log_line ERROR "Configure failed for ${platform_name}/${arch_name}."
+        return 1
+    fi
+
+    log_line INFO "Building ${platform_name}/${arch_name} (jobs=${JOBS})"
+    if ! run_and_log_in "${build_dir}" make -j "${JOBS}"; then
+        log_line ERROR "Build failed for ${platform_name}/${arch_name}."
+        return 1
+    fi
+
+    log_line INFO "Installing libs+headers for ${platform_name}/${arch_name}"
+    if ! run_and_log_in "${build_dir}" make install_sw; then
+        log_line ERROR "install_sw failed for ${platform_name}/${arch_name}."
+        return 1
+    fi
+
+    collect_artifacts "${stage_dir}" "${platform_name}" "${arch_name}" "${configure_target} ${extra_args}"
+}
+
+build_mac() {
+    log_line INFO "Starting mac/arm64 build"
+    build_one mac arm64 "darwin64-arm64" ""
+}
+
+build_ios() {
+    log_line INFO "Starting ios/arm64 build"
+    cross_top="${IOS_CROSS_TOP:-}"
+    cross_sdk="${IOS_CROSS_SDK:-}"
+    if [ -z "${cross_top}" ] || [ -z "${cross_sdk}" ]; then
+        if ! command -v xcrun >/dev/null 2>&1; then
+            log_line ERROR "IOS_CROSS_TOP/IOS_CROSS_SDK are not set and xcrun is unavailable to auto-detect them (needs a macOS host with Xcode)."
+            return 1
+        fi
+        sdk_path=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null) || {
+            log_line ERROR "xcrun could not locate the iphoneos SDK. Install Xcode's command line tools, or set IOS_CROSS_TOP/IOS_CROSS_SDK explicitly."
+            return 1
+        }
+        cross_sdk=$(basename "${sdk_path}")
+        cross_top=$(dirname "$(dirname "${sdk_path}")")
+        log_line INFO "Auto-detected IOS_CROSS_TOP=${cross_top} IOS_CROSS_SDK=${cross_sdk} via xcrun"
+    fi
+    CROSS_TOP="${cross_top}" CROSS_SDK="${cross_sdk}" \
+        build_one ios arm64 "ios64-cross" ""
+}
+
+build_android() {
+    log_line INFO "Starting android/arm64 build"
+    if [ -z "${ANDROID_NDK_HOME:-}" ]; then
+        log_line ERROR "ANDROID_NDK_HOME is not set. Export ANDROID_NDK_HOME and retry."
+        return 1
+    fi
+    android_api=${ANDROID_API:-24}
+    host_tag=""
+    case "$(uname -s)" in
+        Linux) host_tag="linux-x86_64" ;;
+        Darwin) host_tag="darwin-x86_64" ;;
+        MINGW*|MSYS*|CYGWIN*) host_tag="windows-x86_64" ;;
+        *) log_line ERROR "Cannot pick an Android NDK toolchain host tag for host OS $(uname -s)."; return 1 ;;
+    esac
+    ndk_bin="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${host_tag}/bin"
+    if [ ! -d "${ndk_bin}" ]; then
+        log_line ERROR "Android NDK toolchain bin dir not found: ${ndk_bin}"
+        return 1
+    fi
+    ANDROID_NDK_ROOT="${ANDROID_NDK_HOME}" PATH="${ndk_bin}:${PATH}" \
+        build_one android arm64 "android-arm64" "-D__ANDROID_API__=${android_api}"
+}
+
+build_linux() {
+    log_line INFO "Starting linux/x64 build"
+    extra=""
+    if [ -n "${LINUX_X64_CROSS_PREFIX:-}" ]; then
+        extra="--cross-compile-prefix=${LINUX_X64_CROSS_PREFIX}"
+    elif [ "$(uname -s)" != "Linux" ]; then
+        log_line ERROR "linux/x64 build on a non-Linux host needs LINUX_X64_CROSS_PREFIX."
+        return 1
+    fi
+    build_one linux x64 "linux-x86_64" "${extra}"
+}
+
+build_windows() {
+    log_line INFO "Starting windows/x64 build"
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            log_line INFO "Native Windows host detected; using host MinGW-w64 toolchain directly."
+            build_one windows x64 "mingw64" ""
+            return $?
+            ;;
+    esac
+    cross_prefix="${WINDOWS_CROSS_PREFIX:-x86_64-w64-mingw32-}"
+    if ! command -v "${cross_prefix}gcc" >/dev/null 2>&1; then
+        log_line ERROR "${cross_prefix}gcc was not found on PATH. Install a mingw-w64 cross toolchain, or set WINDOWS_CROSS_PREFIX."
+        return 1
+    fi
+    build_one windows x64 "mingw64" "--cross-compile-prefix=${cross_prefix}"
+}
+
+failures=""
+case "${PLATFORM}" in
+    mac) build_mac || failures="${failures} mac/arm64" ;;
+    ios) build_ios || failures="${failures} ios/arm64" ;;
+    android) build_android || failures="${failures} android/arm64" ;;
+    linux) build_linux || failures="${failures} linux/x64" ;;
+    windows) build_windows || failures="${failures} windows/x64" ;;
+esac
+
+if [ -n "${failures}" ]; then
+    log_line ERROR "Build completed with failures:${failures}"
+    log_line ERROR "See full details in ${LOG_FILE}"
+    exit 1
+fi
+
+log_line INFO "Build completed successfully for: ${PLATFORM}"
+log_line INFO "Release root: ${RELEASE_DIR}"
+log_line INFO "Log file: ${LOG_FILE}"
