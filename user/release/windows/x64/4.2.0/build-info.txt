@@ -1,0 +1,7 @@
+timestamp=20260926-200834
+platform=windows
+arch=x64
+version=4.2.0
+openssl_configure_target=VC-WIN64A
+git_commit=6beb9ef352
+log_file=/d/Documents/GitHub/romexplorer/submodules/openssl/user/logs/build-openssl-20260926-200834.log

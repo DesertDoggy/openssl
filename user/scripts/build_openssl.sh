@@ -332,23 +332,92 @@ find_vs_root() {
     printf '%s' "${vs_root}"
 }
 
-# Configure+build+install run inside ONE batch file after `call vcvarsall.bat`, for the same
-# confirmed-by-testing reason as dolphin's build script: environment variables (INCLUDE/LIB/
-# LIBPATH/PATH) exported from bash and then handed down through further process hops (here:
-# perl Configure -> generated nmake makefile -> nmake -> cl/link/nasm) stop propagating
-# correctly partway down that chain. Running everything as a direct child of the same
-# vcvars-configured cmd.exe avoids that. Unix-style paths (cygpath -u results, ROOT_DIR etc)
-# are converted to native Windows form first -- a batch file's own text gets no automatic
-# path translation, unlike a bare argv bash hands straight to a .exe.
+# Runs a small vcvars-initialized batch (one `call vcvarsall.bat` + the given command lines,
+# each guarded by `if errorlevel 1 exit /b 1` -- including the last, which matters: a
+# single-command sequence with no check after it, an earlier bug here, let a failing Configure
+# silently report success) as a single cmd.exe child, capturing output the same way
+# run_and_log_in does (temp file, then cat | tee -a LOG_FILE, so LOG_FILE always gets the real
+# output regardless of how this function's own return value is used). $1 = human label for the
+# [INFO] line; $2.. = command lines to run in order.
+#
+# TMP/TEMP are explicitly overridden to msvc_batch_tmp (an ordinary disk-backed directory under
+# this build's own tree), not left at whatever the calling shell's ambient TMP/TEMP already is
+# -- PATH is the only thing reset above; everything else in the environment, including TMP/
+# TEMP, otherwise passes straight through to this batch. This turned out to matter a great
+# deal: cl.exe writes scratch files during compilation to %TMP%/%TEMP%, and with those left
+# pointed at a RAM-disk-backed drive (as this harness's own scratchpad happens to be), the
+# very first compile of a from-scratch build reliably crashed with "cl : Command line error
+# D8050: cannot execute '...\c1.dll': failed to get command line into debug records" --
+# confirmed by extensive direct testing to disappear completely once TMP/TEMP point at a
+# normal disk directory instead (a dozen-plus reproductions with it unset, zero failures with
+# it set). If this build ever needs to run against some OTHER unusual TMP/TEMP setup and hits
+# a similar toolchain crash again, this is the first thing to check.
+run_vcvars_batch() {
+    label="$1"; shift
+    tmp_bat=$(mktemp --suffix=.bat)
+    win_tmp_bat=$(cygpath -w "${tmp_bat}")
+    {
+        echo "@echo off"
+        echo "set \"PATH=${msvc_batch_path}\""
+        echo "set \"TMP=${msvc_batch_tmp}\""
+        echo "set \"TEMP=${msvc_batch_tmp}\""
+        echo "call \"${vcvarsall}\" x64 >nul 2>&1"
+        echo "cd /d \"${win_build_dir}\""
+        for cmdline in "$@"; do
+            echo "${cmdline}"
+            echo "if errorlevel 1 exit /b 1"
+        done
+        echo "exit /b 0"
+    } > "${tmp_bat}"
+
+    log_line INFO "${label}"
+    rc=0
+    tmp_log="${LOG_DIR}/.cmd-$$-$(date +%s).log"
+    MSYS2_ARG_CONV_EXCL="/c" cmd.exe /c "${win_tmp_bat}" < /dev/null > "${tmp_log}" 2>&1 || rc=$?
+    cat "${tmp_log}" | tee -a "${LOG_FILE}"
+    rm -f "${tmp_log}" "${tmp_bat}"
+    return "${rc}"
+}
+
+# Configure and build+install run as two separate cmd.exe/vcvars sessions (each calling
+# vcvarsall fresh), unlike dolphin's single-session CMake configure+build -- harmless either
+# way here since OpenSSL's build doesn't need vcvars state to survive between Configure and
+# nmake.
+# OpenSSL's Configure needs a NATIVE Windows perl (one whose own paths use backslashes) for
+# MSVC targets -- confirmed directly: it explicitly detects and refuses a Cygwin/MSYS-flavored
+# perl ("This perl implementation doesn't produce Windows like paths"), which is exactly what
+# a bare `perl` resolves to by default in an ordinary MSYS2 or Git-for-Windows shell (both ship
+# their own cygwin-flavored perl ahead of any native one on PATH) -- so this can't just trust
+# whatever `command -v perl` finds. `perl -e 'print $^O'` reports "MSWin32" for a native
+# build and "cygwin" for the wrong kind; if PATH's perl is the wrong kind (or missing), fall
+# back to Strawberry Perl's standard install location, same fallback pattern as find_vs_root.
+find_native_perl() {
+    candidate=$(command -v perl 2>/dev/null) || candidate=""
+    if [ -n "${candidate}" ]; then
+        os_name=$("${candidate}" -e 'print $^O' 2>/dev/null || true)
+        [ "${os_name}" = "MSWin32" ] && { printf '%s' "${candidate}"; return 0; }
+    fi
+    for fallback in "${NATIVE_PERL:-}" "/c/Strawberry/perl/bin/perl.exe"; do
+        [ -n "${fallback}" ] && [ -x "${fallback}" ] && { printf '%s' "${fallback}"; return 0; }
+    done
+    if [ -n "${candidate}" ]; then
+        log_line ERROR "perl on PATH (${candidate}) is a Cygwin/MSYS build; OpenSSL's Configure refuses that for MSVC targets."
+    else
+        log_line ERROR "No perl found on PATH."
+    fi
+    log_line ERROR "Install a native Windows perl -- Strawberry Perl is the standard one: winget install StrawberryPerl.StrawberryPerl -- or set NATIVE_PERL to its perl.exe path."
+    return 1
+}
+
 build_windows_msvc() {
     vs_root=$(find_vs_root) || return 1
     vcvarsall="${vs_root}\\VC\\Auxiliary\\Build\\vcvarsall.bat"
 
-    # perl is resolved to a concrete directory (not left to bare `perl` on PATH) because the
-    # batch file below starts from a clean, minimal PATH -- see dolphin's build script for why
-    # a clean PATH matters for CMake-based builds; less critical for this Configure/nmake-based
-    # one, but resolving it explicitly costs nothing and avoids depending on load order.
-    native_perl=$(command -v perl) || { log_line ERROR "perl not found on PATH."; return 1; }
+    # Resolved to a concrete directory (not left to bare `perl` on PATH) because the batch file
+    # below starts from a clean, minimal PATH -- see dolphin's build script for why a clean
+    # PATH matters for CMake-based builds; less critical for this Configure/nmake-based one,
+    # but resolving it explicitly costs nothing and avoids depending on load order.
+    native_perl=$(find_native_perl) || return 1
     perl_dir=$(cygpath -w "$(dirname "${native_perl}")")
 
     # Optional: OpenSSL's Configure auto-detects nasm for the accelerated x86_64 asm paths;
@@ -359,44 +428,37 @@ build_windows_msvc() {
 
     build_dir="${BUILD_ROOT}/windows/x64"
     stage_dir="${STAGE_ROOT}/windows-x64"
+    wintemp_dir="${BUILD_ROOT}/_wintemp"
     rm -rf "${build_dir}" "${stage_dir}"
-    mkdir -p "${build_dir}" "${stage_dir}"
+    mkdir -p "${build_dir}" "${stage_dir}" "${wintemp_dir}"
 
     win_root_dir=$(cygpath -w "${ROOT_DIR}")
     win_build_dir=$(cygpath -w "${build_dir}")
     win_stage_dir=$(cygpath -w "${stage_dir}")
+    # cl.exe writes scratch files during compilation to %TMP%/%TEMP%, which this shell's own
+    # ambient TMP/TEMP normally leaves pointed at this harness's own scratchpad drive -- not
+    # touched by the PATH override above, since only PATH gets reset, everything else in the
+    # environment still passes through to the batch below. Overriding it to an ordinary
+    # disk-backed directory here, rather than trusting whatever TMP/TEMP already is, avoids
+    # depending on that detail of the calling environment.
+    msvc_batch_tmp=$(cygpath -w "${wintemp_dir}")
+    msvc_batch_path="C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;${perl_dir}${nasm_seg}"
 
     log_line INFO "Using MSVC via: ${vcvarsall}"
-    log_line INFO "Configuring windows/x64 (target: VC-WIN64A)"
 
-    tmp_bat=$(mktemp --suffix=.bat)
-    win_tmp_bat=$(cygpath -w "${tmp_bat}")
-    {
-        echo "@echo off"
-        echo "set \"PATH=C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;${perl_dir}${nasm_seg}\""
-        echo "call \"${vcvarsall}\" x64 >nul 2>&1"
-        echo "cd /d \"${win_build_dir}\""
-        echo "echo [INFO] Configuring ..."
-        echo "perl \"${win_root_dir}\\Configure\" VC-WIN64A shared no-tests no-docs --prefix=\"${win_stage_dir}\" --openssldir=\"${win_stage_dir}\\ssl\""
-        echo "if errorlevel 1 exit /b 1"
-        echo "echo [INFO] Building ..."
-        echo "nmake"
-        echo "if errorlevel 1 exit /b 1"
-        echo "echo [INFO] Installing libs+headers ..."
-        echo "nmake install_sw"
-    } > "${tmp_bat}"
+    # MSYS2_ARG_CONV_EXCL="/c" (inside run_vcvars_batch): without it, MSYS2 mangles the literal
+    # "/c" token (its own drive-mount notation) before cmd.exe ever sees it. < /dev/null:
+    # cmd.exe launched under mintty otherwise gets no properly connected stdin and can hang.
+    # Both confirmed by direct testing in dolphin's build script.
+    if ! run_vcvars_batch "Configuring windows/x64 (target: VC-WIN64A)" \
+        "perl \"${win_root_dir}\\Configure\" VC-WIN64A shared no-tests no-docs --prefix=\"${win_stage_dir}\" --openssldir=\"${win_stage_dir}\\ssl\""
+    then
+        log_line ERROR "Windows MSVC Configure failed (exit ${rc})."
+        return "${rc}"
+    fi
 
-    # MSYS2_ARG_CONV_EXCL="/c": without it, MSYS2 mangles the literal "/c" token (its own
-    # drive-mount notation) before cmd.exe ever sees it. < /dev/null: cmd.exe launched under
-    # mintty otherwise gets no properly connected stdin and can hang. Both confirmed by direct
-    # testing in dolphin's build script.
-    rc=0
-    tmp_log="${LOG_DIR}/.cmd-$$-$(date +%s).log"
-    MSYS2_ARG_CONV_EXCL="/c" cmd.exe /c "${win_tmp_bat}" < /dev/null > "${tmp_log}" 2>&1 || rc=$?
-    cat "${tmp_log}" | tee -a "${LOG_FILE}"
-    rm -f "${tmp_log}" "${tmp_bat}"
-    if [ "${rc}" -ne 0 ]; then
-        log_line ERROR "Windows MSVC configure/build/install failed (exit ${rc})."
+    if ! run_vcvars_batch "Building + installing windows/x64" "nmake" "nmake install_sw"; then
+        log_line ERROR "Windows MSVC build/install failed (exit ${rc})."
         return "${rc}"
     fi
 
