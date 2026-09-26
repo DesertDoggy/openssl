@@ -125,7 +125,15 @@ if ! command -v perl >/dev/null 2>&1; then
     log_line ERROR "perl was not found. OpenSSL's build (Configure) needs it. Install perl and retry."
     exit 2
 fi
-if ! command -v make >/dev/null 2>&1; then
+# make is only needed by the Configure/make(1) targets below (mac/ios/android/linux, and a
+# windows build cross-compiled from a non-Windows host via mingw-w64). A native-Windows
+# windows build instead uses nmake, resolved from vcvarsall.bat inside build_windows_msvc --
+# not expected on PATH ahead of time, so skip this check for that case.
+native_windows_host=0
+case "${PLATFORM}:$(uname -s)" in
+    windows:MINGW*|windows:MSYS*|windows:CYGWIN*) native_windows_host=1 ;;
+esac
+if [ "${native_windows_host}" -eq 0 ] && ! command -v make >/dev/null 2>&1; then
     log_line ERROR "make was not found. Install make (or mingw32-make on Windows, on PATH as 'make') and retry."
     exit 2
 fi
@@ -298,12 +306,109 @@ build_linux() {
     build_one linux x64 "linux-x86_64" "${extra}"
 }
 
+# Locates the Visual Studio install root for the native-Windows MSVC build below. Same
+# rationale/mechanism as submodules/dolphin/user/scripts/build_dolphin_rvz.sh's
+# find_vs_root(): mariadb-server links this OpenSSL build directly via explicit .lib paths
+# (see ../../mariadb-server/user/scripts/build_mariadb_server.sh's ssl_defs_for), and an
+# MSVC-linked mariadbd cannot consume a MinGW-built libcrypto/libssl (.dll.a import libs,
+# MSYS2/UCRT-flavored headers) -- so this build targets MSVC on native Windows to match,
+# same as dolphin/dolphinrvz already does (chdman-simd is the exception that stays MinGW).
+find_vs_root() {
+    vs_root="${VS_INSTALL_DIR:-C:\\Visual Studio\\18\\Community}"
+
+    if [ ! -f "$(cygpath -u "${vs_root}\\VC\\Auxiliary\\Build\\vcvarsall.bat")" ]; then
+        vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+        if [ -f "${vswhere}" ]; then
+            found_root=$("${vswhere}" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>/dev/null | tr -d '\r')
+            [ -n "${found_root}" ] && vs_root="${found_root}"
+        fi
+    fi
+
+    if [ ! -f "$(cygpath -u "${vs_root}\\VC\\Auxiliary\\Build\\vcvarsall.bat")" ]; then
+        log_line ERROR "Visual Studio install not found. Set VS_INSTALL_DIR to your install root, e.g. VS_INSTALL_DIR='C:\\Visual Studio\\18\\Community'"
+        return 1
+    fi
+
+    printf '%s' "${vs_root}"
+}
+
+# Configure+build+install run inside ONE batch file after `call vcvarsall.bat`, for the same
+# confirmed-by-testing reason as dolphin's build script: environment variables (INCLUDE/LIB/
+# LIBPATH/PATH) exported from bash and then handed down through further process hops (here:
+# perl Configure -> generated nmake makefile -> nmake -> cl/link/nasm) stop propagating
+# correctly partway down that chain. Running everything as a direct child of the same
+# vcvars-configured cmd.exe avoids that. Unix-style paths (cygpath -u results, ROOT_DIR etc)
+# are converted to native Windows form first -- a batch file's own text gets no automatic
+# path translation, unlike a bare argv bash hands straight to a .exe.
+build_windows_msvc() {
+    vs_root=$(find_vs_root) || return 1
+    vcvarsall="${vs_root}\\VC\\Auxiliary\\Build\\vcvarsall.bat"
+
+    # perl is resolved to a concrete directory (not left to bare `perl` on PATH) because the
+    # batch file below starts from a clean, minimal PATH -- see dolphin's build script for why
+    # a clean PATH matters for CMake-based builds; less critical for this Configure/nmake-based
+    # one, but resolving it explicitly costs nothing and avoids depending on load order.
+    native_perl=$(command -v perl) || { log_line ERROR "perl not found on PATH."; return 1; }
+    perl_dir=$(cygpath -w "$(dirname "${native_perl}")")
+
+    # Optional: OpenSSL's Configure auto-detects nasm for the accelerated x86_64 asm paths;
+    # without it, it degrades to portable C. This repo already has nasm installed system-wide
+    # for other submodules' builds, so use it when present rather than silently going without.
+    nasm_seg=""
+    [ -f "/c/nasm/nasm.exe" ] && nasm_seg=";C:\\nasm"
+
+    build_dir="${BUILD_ROOT}/windows/x64"
+    stage_dir="${STAGE_ROOT}/windows-x64"
+    rm -rf "${build_dir}" "${stage_dir}"
+    mkdir -p "${build_dir}" "${stage_dir}"
+
+    win_root_dir=$(cygpath -w "${ROOT_DIR}")
+    win_build_dir=$(cygpath -w "${build_dir}")
+    win_stage_dir=$(cygpath -w "${stage_dir}")
+
+    log_line INFO "Using MSVC via: ${vcvarsall}"
+    log_line INFO "Configuring windows/x64 (target: VC-WIN64A)"
+
+    tmp_bat=$(mktemp --suffix=.bat)
+    win_tmp_bat=$(cygpath -w "${tmp_bat}")
+    {
+        echo "@echo off"
+        echo "set \"PATH=C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;${perl_dir}${nasm_seg}\""
+        echo "call \"${vcvarsall}\" x64 >nul 2>&1"
+        echo "cd /d \"${win_build_dir}\""
+        echo "echo [INFO] Configuring ..."
+        echo "perl \"${win_root_dir}\\Configure\" VC-WIN64A shared no-tests no-docs --prefix=\"${win_stage_dir}\" --openssldir=\"${win_stage_dir}\\ssl\""
+        echo "if errorlevel 1 exit /b 1"
+        echo "echo [INFO] Building ..."
+        echo "nmake"
+        echo "if errorlevel 1 exit /b 1"
+        echo "echo [INFO] Installing libs+headers ..."
+        echo "nmake install_sw"
+    } > "${tmp_bat}"
+
+    # MSYS2_ARG_CONV_EXCL="/c": without it, MSYS2 mangles the literal "/c" token (its own
+    # drive-mount notation) before cmd.exe ever sees it. < /dev/null: cmd.exe launched under
+    # mintty otherwise gets no properly connected stdin and can hang. Both confirmed by direct
+    # testing in dolphin's build script.
+    rc=0
+    tmp_log="${LOG_DIR}/.cmd-$$-$(date +%s).log"
+    MSYS2_ARG_CONV_EXCL="/c" cmd.exe /c "${win_tmp_bat}" < /dev/null > "${tmp_log}" 2>&1 || rc=$?
+    cat "${tmp_log}" | tee -a "${LOG_FILE}"
+    rm -f "${tmp_log}" "${tmp_bat}"
+    if [ "${rc}" -ne 0 ]; then
+        log_line ERROR "Windows MSVC configure/build/install failed (exit ${rc})."
+        return "${rc}"
+    fi
+
+    collect_artifacts "${stage_dir}" "windows" "x64" "VC-WIN64A"
+}
+
 build_windows() {
     log_line INFO "Starting windows/x64 build"
     case "$(uname -s)" in
         MINGW*|MSYS*|CYGWIN*)
-            log_line INFO "Native Windows host detected; using host MinGW-w64 toolchain directly."
-            build_one windows x64 "mingw64" ""
+            log_line INFO "Native Windows host detected; building with MSVC (VC-WIN64A) via vcvarsall, matching this repo's dolphin/dolphinrvz build."
+            build_windows_msvc
             return $?
             ;;
     esac
