@@ -20,6 +20,7 @@ LOG_DIR="${USER_DIR}/logs"
 
 PLATFORM=""
 PLATFORM_SET=0
+ARCH=""
 CLEAN=1
 VERSION_OVERRIDE=""
 
@@ -70,6 +71,7 @@ Usage:
 
 Options:
   --platform <mac|ios|android|linux|windows>
+  --arch <x64|arm64>   linux/windows only (default: the host's); mac/ios/android are arm64
   --clean | --no-clean
   --version <value>
   --help
@@ -82,6 +84,8 @@ Environment variables:
   WINDOWS_CROSS_PREFIX             Optional mingw-w64 cross prefix (default:
                                   x86_64-w64-mingw32-) used on a non-Windows host
   LINUX_X64_CROSS_PREFIX          Optional cross-compiler prefix for a Linux x64 cross build
+  LINUX_ARM64_CROSS_PREFIX        Cross-compiler prefix for linux/arm64 from a non-arm64 host
+                                  (default: aarch64-linux-gnu-, from gcc-aarch64-linux-gnu)
   JOBS                            Optional build parallelism (default: host CPU count)
 
 Every target builds shared libssl/libcrypto, skips the test suite and docs (no-tests
@@ -95,6 +99,9 @@ while [ "$#" -gt 0 ]; do
         --platform)
             [ "$#" -ge 2 ] || { log_line ERROR "Missing value for --platform"; exit 2; }
             PLATFORM="$2"; PLATFORM_SET=1; shift 2 ;;
+        --arch)
+            [ "$#" -ge 2 ] || { log_line ERROR "Missing value for --arch"; exit 2; }
+            ARCH="$2"; shift 2 ;;
         --clean) CLEAN=1; shift ;;
         --no-clean) CLEAN=0; shift ;;
         --version)
@@ -120,6 +127,22 @@ else
     esac
     log_line INFO "Auto-detected host platform '${PLATFORM}' from '${host_os}'."
 fi
+
+case "$(uname -m)" in
+    arm64|aarch64) HOST_ARCH="arm64" ;;
+    *) HOST_ARCH="x64" ;;
+esac
+case "${ARCH}" in
+    "") case "${PLATFORM}" in mac|ios|android) ARCH="arm64" ;; *) ARCH="${HOST_ARCH}" ;; esac ;;
+    x64|arm64) ;;
+    aarch64) ARCH="arm64" ;;
+    x86_64|amd64) ARCH="x64" ;;
+    *) log_line ERROR "Invalid --arch value: ${ARCH} (expected x64 or arm64)"; exit 2 ;;
+esac
+case "${PLATFORM}/${ARCH}" in
+    mac/arm64|ios/arm64|android/arm64|linux/x64|linux/arm64|windows/x64|windows/arm64) ;;
+    *) log_line ERROR "Unsupported target ${PLATFORM}/${ARCH}. Supported: mac/arm64 ios/arm64 android/arm64 linux/x64 linux/arm64 windows/x64 windows/arm64"; exit 2 ;;
+esac
 
 if ! command -v perl >/dev/null 2>&1; then
     log_line ERROR "perl was not found. OpenSSL's build (Configure) needs it. Install perl and retry."
@@ -295,6 +318,7 @@ build_android() {
 }
 
 build_linux() {
+    [ "${ARCH}" = "arm64" ] && { build_linux_arm64; return $?; }
     log_line INFO "Starting linux/x64 build"
     extra=""
     if [ -n "${LINUX_X64_CROSS_PREFIX:-}" ]; then
@@ -304,6 +328,23 @@ build_linux() {
         return 1
     fi
     build_one linux x64 "linux-x86_64" "${extra}"
+}
+
+# linux/arm64: native on an aarch64 Linux host, otherwise cross with the GNU aarch64
+# toolchain (apt: gcc-aarch64-linux-gnu). OpenSSL's linux-aarch64 target carries its own
+# armv8 asm, so nothing else changes.
+build_linux_arm64() {
+    log_line INFO "Starting linux/arm64 build"
+    extra=""
+    if [ "$(uname -s)" != "Linux" ] || [ "${HOST_ARCH}" != "arm64" ] || [ -n "${LINUX_ARM64_CROSS_PREFIX:-}" ]; then
+        prefix="${LINUX_ARM64_CROSS_PREFIX:-aarch64-linux-gnu-}"
+        if ! command -v "${prefix}gcc" >/dev/null 2>&1; then
+            log_line ERROR "${prefix}gcc not found. Install gcc-aarch64-linux-gnu (or set LINUX_ARM64_CROSS_PREFIX)."
+            return 1
+        fi
+        extra="--cross-compile-prefix=${prefix}"
+    fi
+    build_one linux arm64 "linux-aarch64" "${extra}"
 }
 
 # Locates the Visual Studio install root for the native-Windows MSVC build below. Same
@@ -361,7 +402,7 @@ run_vcvars_batch() {
         echo "set \"PATH=${msvc_batch_path}\""
         echo "set \"TMP=${msvc_batch_tmp}\""
         echo "set \"TEMP=${msvc_batch_tmp}\""
-        echo "call \"${vcvarsall}\" x64 >nul 2>&1"
+        echo "call \"${vcvarsall}\" ${vcvars_arch} >nul 2>&1"
         echo "cd /d \"${win_build_dir}\""
         for cmdline in "$@"; do
             echo "${cmdline}"
@@ -424,10 +465,19 @@ build_windows_msvc() {
     # without it, it degrades to portable C. This repo already has nasm installed system-wide
     # for other submodules' builds, so use it when present rather than silently going without.
     nasm_seg=""
-    [ -f "/c/nasm/nasm.exe" ] && nasm_seg=";C:\\nasm"
+    [ "${ARCH}" = "x64" ] && [ -f "/c/nasm/nasm.exe" ] && nasm_seg=";C:\\nasm"
 
-    build_dir="${BUILD_ROOT}/windows/x64"
-    stage_dir="${STAGE_ROOT}/windows-x64"
+    # arm64 is cross-compiled from an x64 host (vcvarsall x64_arm64) or native on an arm64
+    # one; VC-WIN64-ARM is OpenSSL's MSVC arm64 target and needs no assembler.
+    case "${ARCH}" in
+        x64) configure_target="VC-WIN64A"; vcvars_arch="x64" ;;
+        arm64)
+            configure_target="VC-WIN64-ARM"
+            if [ "${PROCESSOR_ARCHITECTURE:-}" = "ARM64" ]; then vcvars_arch="arm64"; else vcvars_arch="x64_arm64"; fi ;;
+    esac
+
+    build_dir="${BUILD_ROOT}/windows/${ARCH}"
+    stage_dir="${STAGE_ROOT}/windows-${ARCH}"
     wintemp_dir="${BUILD_ROOT}/_wintemp"
     rm -rf "${build_dir}" "${stage_dir}"
     mkdir -p "${build_dir}" "${stage_dir}" "${wintemp_dir}"
@@ -450,23 +500,23 @@ build_windows_msvc() {
     # "/c" token (its own drive-mount notation) before cmd.exe ever sees it. < /dev/null:
     # cmd.exe launched under mintty otherwise gets no properly connected stdin and can hang.
     # Both confirmed by direct testing in dolphin's build script.
-    if ! run_vcvars_batch "Configuring windows/x64 (target: VC-WIN64A)" \
-        "perl \"${win_root_dir}\\Configure\" VC-WIN64A shared no-tests no-docs --prefix=\"${win_stage_dir}\" --openssldir=\"${win_stage_dir}\\ssl\""
+    if ! run_vcvars_batch "Configuring windows/${ARCH} (target: ${configure_target})" \
+        "perl \"${win_root_dir}\\Configure\" ${configure_target} shared no-tests no-docs --prefix=\"${win_stage_dir}\" --openssldir=\"${win_stage_dir}\\ssl\""
     then
         log_line ERROR "Windows MSVC Configure failed (exit ${rc})."
         return "${rc}"
     fi
 
-    if ! run_vcvars_batch "Building + installing windows/x64" "nmake" "nmake install_sw"; then
+    if ! run_vcvars_batch "Building + installing windows/${ARCH}" "nmake" "nmake install_sw"; then
         log_line ERROR "Windows MSVC build/install failed (exit ${rc})."
         return "${rc}"
     fi
 
-    collect_artifacts "${stage_dir}" "windows" "x64" "VC-WIN64A"
+    collect_artifacts "${stage_dir}" "windows" "${ARCH}" "${configure_target}"
 }
 
 build_windows() {
-    log_line INFO "Starting windows/x64 build"
+    log_line INFO "Starting windows/${ARCH} build"
     case "$(uname -s)" in
         MINGW*|MSYS*|CYGWIN*)
             log_line INFO "Native Windows host detected; building with MSVC (VC-WIN64A) via vcvarsall, matching this repo's dolphin/dolphinrvz build."
@@ -474,6 +524,10 @@ build_windows() {
             return $?
             ;;
     esac
+    if [ "${ARCH}" = "arm64" ]; then
+        log_line ERROR "windows/arm64 is built with MSVC on a Windows host only; cross-building it with mingw is not wired up."
+        return 1
+    fi
     cross_prefix="${WINDOWS_CROSS_PREFIX:-x86_64-w64-mingw32-}"
     if ! command -v "${cross_prefix}gcc" >/dev/null 2>&1; then
         log_line ERROR "${cross_prefix}gcc was not found on PATH. Install a mingw-w64 cross toolchain, or set WINDOWS_CROSS_PREFIX."
@@ -487,8 +541,8 @@ case "${PLATFORM}" in
     mac) build_mac || failures="${failures} mac/arm64" ;;
     ios) build_ios || failures="${failures} ios/arm64" ;;
     android) build_android || failures="${failures} android/arm64" ;;
-    linux) build_linux || failures="${failures} linux/x64" ;;
-    windows) build_windows || failures="${failures} windows/x64" ;;
+    linux) build_linux || failures="${failures} linux/${ARCH}" ;;
+    windows) build_windows || failures="${failures} windows/${ARCH}" ;;
 esac
 
 if [ -n "${failures}" ]; then
@@ -497,6 +551,6 @@ if [ -n "${failures}" ]; then
     exit 1
 fi
 
-log_line INFO "Build completed successfully for: ${PLATFORM}"
+log_line INFO "Build completed successfully for: ${PLATFORM}/${ARCH}"
 log_line INFO "Release root: ${RELEASE_DIR}"
 log_line INFO "Log file: ${LOG_FILE}"
