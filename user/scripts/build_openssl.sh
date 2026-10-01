@@ -40,11 +40,14 @@ log_line() {
 
 run_and_log() {
     log_line INFO "RUN: $*"
-    tmp_log="${LOG_DIR}/.cmd-$$-$(date +%s).log"
-    rc=0
-    "$@" > "${tmp_log}" 2>&1 || rc=$?
-    cat "${tmp_log}" | tee -a "${LOG_FILE}"
-    rm -f "${tmp_log}"
+    # Streamed, not buffered until the command ends: a twenty-minute build that prints
+    # nothing looks exactly like a hang, and scripts/build_native_deps.sh shows the newest
+    # log line as progress. POSIX sh has no pipefail, so the status crosses the pipe in a file.
+    rc_file="${LOG_DIR}/.rc-$$"
+    rm -f "${rc_file}"
+    { rc=0; "$@" 2>&1 || rc=$?; echo "${rc}" > "${rc_file}"; } | tee -a "${LOG_FILE}"
+    rc=$(cat "${rc_file}" 2>/dev/null || echo 1)
+    rm -f "${rc_file}"
     [ "${rc}" -eq 0 ] && return 0
     log_line ERROR "Command failed (exit=${rc}): $*"
     return "${rc}"
@@ -54,11 +57,11 @@ run_and_log_in() {
     # Same as run_and_log, but runs "$@" with cwd set to $1 first.
     dir="$1"; shift
     log_line INFO "RUN (in ${dir}): $*"
-    tmp_log="${LOG_DIR}/.cmd-$$-$(date +%s).log"
-    rc=0
-    ( cd "${dir}" && "$@" ) > "${tmp_log}" 2>&1 || rc=$?
-    cat "${tmp_log}" | tee -a "${LOG_FILE}"
-    rm -f "${tmp_log}"
+    rc_file="${LOG_DIR}/.rc-$$"
+    rm -f "${rc_file}"
+    { rc=0; ( cd "${dir}" && "$@" ) 2>&1 || rc=$?; echo "${rc}" > "${rc_file}"; } | tee -a "${LOG_FILE}"
+    rc=$(cat "${rc_file}" 2>/dev/null || echo 1)
+    rm -f "${rc_file}"
     [ "${rc}" -eq 0 ] && return 0
     log_line ERROR "Command failed (exit=${rc}): $*"
     return "${rc}"
@@ -190,6 +193,30 @@ fi
 JOBS_DEFAULT=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 JOBS=${JOBS:-${JOBS_DEFAULT}}
 
+# mac only. OpenSSL stamps each dylib with its --prefix as install name, and that prefix is
+# the scratch stage dir under user/_build/. Everything linked against these libraries (both
+# mariadbs, the GUI through openssl-sys) copies that id into its own load commands, so it
+# would only ever run on this machine, and only until the next clean build. Rewritten here,
+# before anything links: the id becomes @rpath/<name> (consumers already carry an rpath to
+# wherever the libraries are deployed beside them), and libssl's own reference to libcrypto
+# becomes @loader_path/<name>, since the two always travel together and libssl has no rpath.
+# install_name_tool invalidates the signature arm64 requires, hence the ad-hoc re-sign.
+relocate_macos_dylibs() {
+    shared_dir="$1"
+    stage_lib="$2"
+    for f in "${shared_dir}"/*.dylib; do
+        [ -f "${f}" ] && [ ! -L "${f}" ] || continue
+        install_name_tool -id "@rpath/$(basename "${f}")" "${f}" || return 1
+        otool -L "${f}" | awk 'NR > 1 { print $1 }' | while IFS= read -r dep; do
+            case "${dep}" in
+                "${stage_lib}"/*) install_name_tool -change "${dep}" "@loader_path/$(basename "${dep}")" "${f}" || exit 1 ;;
+            esac
+        done || return 1
+        codesign --force --sign - "${f}" 2>/dev/null || return 1
+    done
+    log_line INFO "Rewrote install names under ${shared_dir} to @rpath/@loader_path"
+}
+
 collect_artifacts() {
     stage_dir="$1"
     platform_name="$2"
@@ -219,6 +246,13 @@ collect_artifacts() {
 
     if [ -d "${stage_dir}/include" ]; then
         cp -R "${stage_dir}/include/." "${out_include}/"
+    fi
+
+    if [ "${platform_name}" = "mac" ]; then
+        relocate_macos_dylibs "${out_shared}" "${stage_dir}/lib" || {
+            log_line ERROR "Could not rewrite the dylib install names under ${out_shared}."
+            return 1
+        }
     fi
 
     {
