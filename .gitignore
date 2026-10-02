@@ -571,3 +571,4 @@ depend
 !/user/release/*/*/*/
 !/user/release/*/*/*/**
 /user/release
+/user/release
